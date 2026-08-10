@@ -1,24 +1,16 @@
 name: Morning Briefing
 
 on:
-  # Actions-cron laeuft in UTC und startet oft 10-20 Min spaeter.
-  # Wir feuern breit um die deutsche 08:00-Zeit herum; das Python-Skript
-  # laesst nur den Lauf durch, der wirklich in die lokale 08:00-Stunde faellt.
-  #   Winter (UTC+1): 08:00 lokal = 07:00 UTC
-  #   Sommer (UTC+2): 08:00 lokal = 06:00 UTC
   schedule:
-    - cron: "45 6 * * *"   # ~08:45 Winter-Toleranz / 07:45 wird vom Skript geblockt
+    - cron: "45 6 * * *"   # Winter-Fenster (08:00 lokal ~ 07:00 UTC, mit Toleranz)
     - cron: "45 5 * * *"   # Sommer-Fenster
-  # Manuelles Ausloesen per Knopf (immer erlaubt, umgeht das Zeitfenster).
   workflow_dispatch:
 
-# Rechte fuers Pages-Deployment.
 permissions:
-  contents: read
+  contents: write          # noetig, um die aktualisierte .ics zurueck ins Repo zu committen
   pages: write
   id-token: write
 
-# Nie zwei Deployments gleichzeitig.
 concurrency:
   group: "pages"
   cancel-in-progress: false
@@ -41,19 +33,29 @@ jobs:
       - name: Abhaengigkeiten
         run: |
           python -m pip install --upgrade pip
-          pip install requests google-api-python-client google-auth-oauthlib google-auth-httplib2
+          pip install requests
 
-      - name: Briefing generieren
+      - name: Briefing generieren + ICS pflegen
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GOOGLE_TOKEN:      ${{ secrets.GOOGLE_TOKEN }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           PAGES_URL:         ${{ vars.PAGES_URL }}
           BRIEFING_MODEL:    "claude-sonnet-4-5"
           BRIEFING_TZ:       "Europe/Berlin"
-          # Bei manuellem Start das Zeitfenster umgehen:
           FORCE_RUN:         ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python generate_briefing.py
+
+      - name: Aktualisierte ICS ins Repo zurueckschreiben
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Nur committen, wenn sich die ICS wirklich geaendert hat
+          if [ -n "$(git status --porcelain public/briefing.ics)" ]; then
+            git add public/briefing.ics
+            git commit -m "Update briefing.ics ($(date -u +%Y-%m-%d))"
+            git push
+          else
+            echo "Keine ICS-Aenderung – nichts zu committen (Lauf ausserhalb Zeitfenster)."
+          fi
 
       - name: Pages konfigurieren
         uses: actions/configure-pages@v5
