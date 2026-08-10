@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Morning Briefing – GitHub-Actions-Variante.
+Morning Briefing – GitHub-Actions-Variante mit ICS-Abo-Kalender.
 
-Laeuft vollstaendig in der GitHub-Cloud, kein eigener Rechner noetig.
+Vollstaendig in der GitHub-Cloud, kein eigener Rechner, KEIN Google-Login/Token noetig.
   1. Holt RSS-Feeds per HTTP (nicht erreichbare Quellen werden uebersprungen -> Fallback).
   2. Generiert ein HTML-Dashboard via Anthropic API.
-  3. Schreibt es nach public/index.html -> wird von GitHub Pages gehostet.
-  4. Legt einen Google-Calendar-Eintrag "Morning Briefing: DD/MM/YY" um 08:00 an.
+  3. Schreibt es nach public/index.html -> GitHub Pages hostet es.
+  4. Ergaenzt public/briefing.ics um einen Termin "Morning Briefing: DD/MM/YY" (08:00),
+     mit Link zum Dashboard. Diese ICS abonnierst du EINMAL in Google Calendar per URL;
+     neue Briefings erscheinen dann automatisch. Kein OAuth, kein Token.
 
-Alle Secrets kommen aus den GitHub-Actions-Secrets (Umgebungsvariablen), NICHT aus .env.
+Die ICS sammelt ALLE bisherigen Termine (wird ins Repo zurueckgeschrieben), damit ein
+abonnierter Kalender die Historie nicht verliert.
+
+Secrets: nur ANTHROPIC_API_KEY (aus GitHub-Actions-Secrets).
 """
 
 import os
+import re
 import sys
 import json
-import base64
 import datetime as dt
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -22,18 +27,12 @@ from zoneinfo import ZoneInfo
 import requests
 
 # ------------------------------------------------------------------ #
-# Konfiguration aus Umgebungsvariablen (GitHub Secrets)
+# Konfiguration
 # ------------------------------------------------------------------ #
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 MODEL             = os.environ.get("BRIEFING_MODEL", "claude-sonnet-4-5").strip()
 TZ_NAME           = os.environ.get("BRIEFING_TZ", "Europe/Berlin").strip()
-
-# Google OAuth (als Secrets hinterlegt, siehe Anleitung)
-GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "").strip()  # Inhalt credentials.json
-GOOGLE_TOKEN       = os.environ.get("GOOGLE_TOKEN", "").strip()        # Inhalt token.json
-
-# Oeffentliche Pages-URL (fuer den Link im Kalender). Wird als Secret/Variable gesetzt.
-PAGES_URL = os.environ.get("PAGES_URL", "").strip()
+PAGES_URL         = os.environ.get("PAGES_URL", "").strip()  # z. B. https://name.github.io/morning-briefing/
 
 RSS_FEEDS = [
     ("FAZ Wirtschaft",        "https://www.faz.net/rss/aktuell/wirtschaft/"),
@@ -44,6 +43,7 @@ RSS_FEEDS = [
 
 PUBLIC_DIR = Path(__file__).parent / "public"
 PUBLIC_DIR.mkdir(exist_ok=True)
+ICS_PATH = PUBLIC_DIR / "briefing.ics"
 
 
 def log(msg: str) -> None:
@@ -55,22 +55,15 @@ def local_today() -> dt.date:
     return dt.datetime.now(ZoneInfo(TZ_NAME)).date()
 
 
-# ------------------------------------------------------------------ #
-# Zeitfenster-Check: Actions-cron laeuft in UTC und ungenau.
-# Wir feuern per cron etwas grosszuegig und lassen NUR den Lauf durch,
-# der zur lokalen 08:00-Stunde passt. So klappt es Sommer wie Winter.
-# ------------------------------------------------------------------ #
 def within_target_window() -> bool:
-    # Manuelle Ausloesung (workflow_dispatch) immer erlauben.
     if os.environ.get("FORCE_RUN", "").strip() == "1":
         return True
     now_local = dt.datetime.now(ZoneInfo(TZ_NAME))
-    # Zielstunde 8; Toleranz, da Actions bis ~20 Min spaeter startet.
     return now_local.hour == 8 or (now_local.hour == 7 and now_local.minute >= 40)
 
 
 # ------------------------------------------------------------------ #
-# 1. RSS sammeln (Fallback pro Feed)
+# 1. RSS sammeln
 # ------------------------------------------------------------------ #
 def collect_feed_items(max_per_feed: int = 6) -> str:
     import xml.etree.ElementTree as ET
@@ -151,68 +144,93 @@ def build_dashboard_html(feed_text: str, today: dt.date) -> str:
     return html
 
 
-# ------------------------------------------------------------------ #
-# 3. Nach public/index.html schreiben (GitHub Pages hostet das)
-# ------------------------------------------------------------------ #
 def write_public(html: str, today: dt.date) -> None:
     (PUBLIC_DIR / "index.html").write_text(html, encoding="utf-8")
-    # zusaetzlich datierte Archivkopie
     (PUBLIC_DIR / f"{today.strftime('%Y-%m-%d')}.html").write_text(html, encoding="utf-8")
     log("public/index.html geschrieben.")
 
 
 # ------------------------------------------------------------------ #
-# 4. Google-Calendar-Eintrag
+# 3. ICS-Kalender pflegen (Termin ergaenzen, Historie erhalten)
 # ------------------------------------------------------------------ #
-def create_calendar_event(today: dt.date) -> None:
-    if not GOOGLE_TOKEN:
-        log("GOOGLE_TOKEN fehlt – Kalendereintrag uebersprungen.")
-        return
-    try:
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        from googleapiclient.discovery import build
-    except ImportError:
-        log("Google-Bibliotheken fehlen – Kalendereintrag uebersprungen.")
-        return
+def ics_escape(text: str) -> str:
+    # RFC 5545: Kommas, Semikolons, Backslashes und Zeilenumbrueche maskieren.
+    return (text.replace("\\", "\\\\")
+                .replace(",", "\\,")
+                .replace(";", "\\;")
+                .replace("\n", "\\n"))
 
-    SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
-    info = json.loads(GOOGLE_TOKEN)
-    creds = Credentials.from_authorized_user_info(info, SCOPES)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
 
-    service = build("calendar", "v3", credentials=creds)
+def build_event_block(today: dt.date) -> str:
     datum = today.strftime("%d/%m/%y")
-    start = dt.datetime.combine(today, dt.time(8, 0))
-    end   = start + dt.timedelta(minutes=15)
+    # Ganzjahres-stabile UID pro Tag -> kein Duplikat bei Mehrfachlauf.
+    uid = f"briefing-{today.strftime('%Y%m%d')}@morning-briefing"
+    dtstart = f"{today.strftime('%Y%m%d')}T080000"
+    dtend   = f"{today.strftime('%Y%m%d')}T081500"
+    dtstamp = dt.datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
     link = PAGES_URL or "(kein Link gesetzt)"
+    summary = ics_escape(f"Morning Briefing: {datum}")
+    desc = ics_escape(f"Taegliches Dashboard: {link}")
+    return "\n".join([
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{dtstamp}",
+        f"DTSTART;TZID={TZ_NAME}:{dtstart}",
+        f"DTEND;TZID={TZ_NAME}:{dtend}",
+        f"SUMMARY:{summary}",
+        f"DESCRIPTION:{desc}",
+        f"URL:{link}",
+        "BEGIN:VALARM",
+        "TRIGGER:PT0M",
+        "ACTION:DISPLAY",
+        f"DESCRIPTION:{summary}",
+        "END:VALARM",
+        "END:VEVENT",
+    ])
 
-    event = {
-        "summary": f"Morning Briefing: {datum}",
-        "description": f"Taegliches Dashboard:\n{link}",
-        "start": {"dateTime": start.isoformat(), "timeZone": TZ_NAME},
-        "end":   {"dateTime": end.isoformat(),   "timeZone": TZ_NAME},
-        "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 0}]},
-    }
-    try:
-        created = service.events().insert(calendarId="primary", body=event).execute()
-        log(f"Kalendereintrag erstellt: {created.get('htmlLink')}")
-    except Exception as e:
-        log(f"Kalendereintrag fehlgeschlagen: {e}")
+
+def update_ics(today: dt.date) -> None:
+    new_uid = f"briefing-{today.strftime('%Y%m%d')}@morning-briefing"
+    new_block = build_event_block(today)
+
+    header = "\n".join([
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Morning Briefing//DE",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:Morning Briefing",
+        "X-WR-TIMEZONE:" + TZ_NAME,
+    ])
+    footer = "END:VCALENDAR"
+
+    existing_events = ""
+    if ICS_PATH.exists():
+        content = ICS_PATH.read_text(encoding="utf-8")
+        # Bestehende VEVENT-Bloecke extrahieren
+        blocks = re.findall(r"BEGIN:VEVENT.*?END:VEVENT", content, flags=re.DOTALL)
+        # Heutigen (gleiche UID) rausfiltern, um Duplikate zu vermeiden
+        blocks = [b for b in blocks if new_uid not in b]
+        if blocks:
+            existing_events = "\n".join(blocks) + "\n"
+
+    ics = header + "\n" + existing_events + new_block + "\n" + footer + "\n"
+    ICS_PATH.write_text(ics, encoding="utf-8")
+    n = ics.count("BEGIN:VEVENT")
+    log(f"briefing.ics aktualisiert ({n} Termin(e) gesamt).")
 
 
+# ------------------------------------------------------------------ #
 def main() -> None:
     if not within_target_window():
-        log("Ausserhalb des 08:00-Zielfensters – Lauf uebersprungen "
-            "(Actions-cron feuert breiter, das ist normal).")
+        log("Ausserhalb des 08:00-Zielfensters – Lauf uebersprungen.")
         return
     today = local_today()
     log(f"=== Morning Briefing {today.strftime('%d/%m/%y')} ===")
     feed_text = collect_feed_items()
     html = build_dashboard_html(feed_text, today)
     write_public(html, today)
-    create_calendar_event(today)
+    update_ics(today)
     log("=== Fertig ===")
 
 
