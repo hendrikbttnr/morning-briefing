@@ -1,0 +1,22 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Morning Briefing//DE
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+X-WR-CALNAME:Morning Briefing
+X-WR-TIMEZONE:Europe/Berlin
+BEGIN:VEVENT
+UID:briefing-20260810@morning-briefing
+DTSTAMP:20260810T140059Z
+DTSTART;TZID=Europe/Berlin:20260810T080000
+DTEND;TZID=Europe/Berlin:20260810T081500
+SUMMARY:Morning Briefing: 10/08/26
+DESCRIPTION:Taegliches Dashboard: https://hendrikbttnr.github.io/morning-briefing/
+URL:https://hendrikbttnr.github.io/morning-briefing/
+BEGIN:VALARM
+TRIGGER:PT0M
+ACTION:DISPLAY
+DESCRIPTION:Morning Briefing: 10/08/26
+END:VALARM
+END:VEVENT
+END:VCALENDAR
