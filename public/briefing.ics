@@ -117,4 +117,18 @@ ACTION:DISPLAY
 DESCRIPTION:Morning Briefing: 18/08/26
 END:VALARM
 END:VEVENT
+BEGIN:VEVENT
+UID:briefing-20260819@morning-briefing
+DTSTAMP:20260819T060324Z
+DTSTART;TZID=Europe/Berlin:20260819T080000
+DTEND;TZID=Europe/Berlin:20260819T081500
+SUMMARY:Morning Briefing: 19/08/26
+DESCRIPTION:Taegliches Dashboard: https://hendrikbttnr.github.io/morning-briefing/
+URL:https://hendrikbttnr.github.io/morning-briefing/
+BEGIN:VALARM
+TRIGGER:PT0M
+ACTION:DISPLAY
+DESCRIPTION:Morning Briefing: 19/08/26
+END:VALARM
+END:VEVENT
 END:VCALENDAR
